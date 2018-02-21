@@ -1,0 +1,479 @@
+#!/bin/sh
+############################################################################################################
+# TYPE : Wrapper Shell Script #
+# NAME : EventBuffer_HistoryTable_Load.sh #
+# PURPOSE : This is the wrapper script for Big Data Sync process #
+# #
+# USAGE : EventBuffer_HistoryTable_Load.sh SUBJ_AREA #
+# #
+# #
+# Author Date Ver Description #
+# Infosys Ltd 07 May 2017 1.0 Initial Wrapper Script for EventBuffer_HistoryTable_Load #
+############################################################################################################
+
+wrapper_start_date=`date +%s`
+. ~/CONFIG/env_setup.sh
+cdate=`date +%Y%m%d%H%M%S`
+
+#Get the MYSQL Host,database,encrypted user and password from Pete_Conn_Params.txt
+num=$#
+echo "Parameters passed $*"
+echo "Number of Parameters: $#"
+
+queue_mst="queue_cntl_master"
+
+event_tbl=event_buffer
+event_hist=${event_tbl}_history
+date_col=create_date
+
+JOB_PARAM_FILE=${CONFIG_DIR}/Pete_Conn_Params.txt
+CON_FILE=${CONFIG_DIR}/event_buffer_con.txt
+
+if [ -s $CON_FILE ];then
+ rm -r $CON_FILE
+else
+ touch $CON_FILE
+ chmod 777 $CON_FILE
+fi
+
+#for i in $@
+#do
+#if [ -s ${CONFIG_DIR}/$i ]; then
+# echo "Changing connection file"
+# export filename=$i
+# export JOB_PARAM_FILE=${CONFIG_DIR}/$i
+# ##echo ${JOB_PARAM_FILE}
+# echo "Param File used: "$JOB_PARAM_FILE
+# num=$[$num-1]
+# break;
+#fi
+#done
+
+## echo $JOB_PARAM_FILE
+
+#Get the MYSQL Host,database,encrypted user and password from Pete_Conn_Params.txt
+export MYSQL_HOST=`grep -R -w "MYSQL_HOST" ${JOB_PARAM_FILE} | cut -d'~' -f2`
+export MYSQL_DB=`grep -R -w "MYSQL_DB" ${JOB_PARAM_FILE} | cut -d'~' -f2`
+export MYSQL_USER_ENC=`grep -R "Encrypt_MYSQL_USER" ${JOB_PARAM_FILE} | cut -d'~' -f2`
+export MYSQL_PWD_ENC=`grep -R "Encrypt_MYSQL_PWD" ${JOB_PARAM_FILE} | cut -d'~' -f2`
+
+
+#Decrypt the encrypted user and password using the AES Decryption
+export MYSQL_USER=$(java -cp ${JAR_DIR}/commons-codec-1.7.jar:${JAR_DIR}/javax-crypto.jar:${JAR_DIR}/jsr177.jar:${JAR_DIR}/Decrypt.jar Decrypt $MYSQL_USER_ENC)
+export MYSQL_PWD=$(java -cp ${JAR_DIR}/commons-codec-1.7.jar:${JAR_DIR}/javax-crypto.jar:${JAR_DIR}/jsr177.jar:${JAR_DIR}/Decrypt.jar Decrypt $MYSQL_PWD_ENC)
+
+#ENC_USER=`grep -R "Encrypt_MYSQL_USER" ${JOB_PARAM_FILE} | cut -d'~' -f2`
+
+
+
+for i in $@
+do
+re='^[0-9]+$'
+if ! [[ $i =~ $re ]];then
+#echo "Not a number $i"
+TestRes=`mysql -h$MYSQL_HOST -u$MYSQL_USER -p$MYSQL_PWD -D${MYSQL_DB} -e "select '${i}' = (select Distinct source from ${queue_mst} where source='${i}');"`
+
+ #echo ${TestRes}
+
+ Res=`echo $TestRes | cut -d ')' -f2 |cut -d' ' -f2`
+ #echo $Res
+
+
+ if [ $Res != 0 ] && [ $Res != 'NULL' ];then
+ export SUBJ_AREA=$i
+
+ else
+ TestRes=`mysql -h$MYSQL_HOST -u$MYSQL_USER -p$MYSQL_PWD -D$MYSQL_DB -e "select '${i}' = (select Distinct tgt_tbl_n from ${queue_mst} where tgt_tbl_n='${i}');"`
+ #echo $TestRes
+ Res=`echo $TestRes | cut -d ')' -f2 |cut -d' ' -f2`
+ #echo $Res
+
+ if [ $Res != 0 ] && [ $Res != 'NULL' ];then
+ export TBL_NAME=$i
+ else
+ if [ "$i" = "$filename" ];then
+ echo
+ else
+ echo "argument $i is neither a suBJ_AREA/TableName nor Number of Days"
+
+ exit 8
+ fi
+
+ fi
+ fi
+
+else
+echo "Number $i"
+export DT_FLT=$i
+fi
+
+#echo $i
+done
+
+decrypt()
+{
+export event_user=$(java -cp ${JAR_DIR}/commons-codec-1.7.jar:${JAR_DIR}/javax-crypto.jar:${JAR_DIR}/jsr177.jar:${JAR_DIR}/Decrypt.jar Decrypt $1)
+export event_pwd=$(java -cp ${JAR_DIR}/commons-codec-1.7.jar:${JAR_DIR}/javax-crypto.jar:${JAR_DIR}/jsr177.jar:${JAR_DIR}/Decrypt.jar Decrypt $2)
+echo event_user~$event_user>>$CON_FILE
+echo event_pwd~$event_pwd>>$CON_FILE
+}
+
+
+assignValues()
+{
+OFS=$IFS;
+COND=$2
+IFS='#'; read -ra test <<< "$1"
+export host=${test[0]}
+event_user=${test[1]}
+event_pwd=${test[2]}
+export event_db=${test[3]}
+export event_tbl=${test[4]}
+export consumer_config=${test[5]}
+
+export event_hist="${event_tbl}_history"
+echo host~$host>>$CON_FILE
+echo event_db~$event_db>>$CON_FILE
+echo event_tbl~$event_tbl>>$CON_FILE
+echo event_hist~$event_hist>>$CON_FILE
+echo consumer_config~$consumer_config>>$CON_FILE
+
+decrypt $event_user $event_pwd
+
+execute
+
+IFS=$OFS
+#return 0
+}
+
+
+getConnection()
+{
+filter=$1
+export COND=$2
+gconn=`mysql -h$MYSQL_HOST -u$MYSQL_USER -p$MYSQL_PWD -D$MYSQL_DB -e "select concat(host_event_buffer,'#',userName_event_buffer,'#',password_event_buffer,'#',db_event_buffer,'#',table_event_buffer,'#',consumer_config) from ${queue_mst} where $1 limit 1"| tail -1`
+
+#echo $gconn
+
+assignValues $gconn $COND
+#return 0
+}
+
+
+MySQL_Recrd_to_Archive()
+{
+
+host=`grep -R -w "host" $CON_FILE | cut -d '~' -f2`
+event_db=`grep -R -w "event_db" $CON_FILE | cut -d '~' -f2`
+event_user=`grep -R -w "event_user" $CON_FILE | cut -d '~' -f2`
+event_pwd=`grep -R -w "event_pwd" $CON_FILE | cut -d '~' -f2`
+event_tbl=`grep -R -w "event_tbl" $CON_FILE | cut -d '~' -f2`
+event_hist=`grep -R -w "event_hist" $CON_FILE | cut -d '~' -f2`
+COND=`grep -R -w "COND" $CON_FILE | cut -d '~' -f2`
+consumer_config=`grep -R -w "consumer_config" $CON_FILE |cut -d '~' -f2`
+
+ str_tm=`date +%s`
+
+##### Inserting records which are ready for Archival (Flag as A) from event_buffer to Hist table.
+
+#echo "mysql -h$host -D$event_db -u$event_user -p$event_pwd -e 'START TRANSACTION; BEGIN;use $event_db ;INSERT INTO ${event_hist} SELECT * FROM ${event_tbl} WHERE ${COND} ; COMMIT; '"
+
+MySQLInsHist=`mysql -h$host -D$event_db -u$event_user -p$event_pwd -e "START TRANSACTION; BEGIN;use $event_db ;INSERT INTO ${event_hist} SELECT * FROM ${event_tbl} WHERE ${COND} ; COMMIT; "`
+ARCH=$?
+
+ end_tm=`date +%s`
+
+ time_taken=`expr $end_tm - $str_tm`
+
+
+if [ $ARCH -eq 0 ];then
+ echo -e "\nHistory table load successful\n"
+ echo "Time taken to Insert to History table (in sec): $time_taken"
+ echo
+else
+ echo "History table load Failed!!!.. Script Exiting....!! "
+ echo "History table load Failed for $event_db !!!.. Script Exiting....!! Please check. Application: PBDIARCHIVE" |mail -s "Event Buffer Archival Failure" -r noreply@petebi-gap.com $consumer_config
+ return 8
+fi
+
+}
+
+MySQL_Recrd_Del()
+{
+
+host=`grep -R -w "host" $CON_FILE | cut -d '~' -f2`
+event_db=`grep -R -w "event_db" $CON_FILE | cut -d '~' -f2`
+event_user=`grep -R -w "event_user" $CON_FILE | cut -d '~' -f2`
+event_pwd=`grep -R -w "event_pwd" $CON_FILE | cut -d '~' -f2`
+event_tbl=`grep -R -w "event_tbl" $CON_FILE | cut -d '~' -f2`
+event_hist=`grep -R -w "event_hist" $CON_FILE | cut -d '~' -f2`
+COND=`grep -R -w "COND" $CON_FILE | cut -d '~' -f2`
+consumer_config=`grep -R -w "consumer_config" $CON_FILE |cut -d '~' -f2`
+
+ str_tm=`date +%s`
+#### Deleting records which are ready for Archival from event_buffer
+
+#echo "mysql -h$host -D$event_db -u$event_user -p$event_pwd -e 'START TRANSACTION; BEGIN;use $event_db ;DELETE FROM ${event_tbl} WHERE ${COND} and process_id in (select distinct process_id from ${event_hist} where ${COND}); COMMIT;'"
+
+MySQLDelete=`mysql -h$host -D$event_db -u$event_user -p$event_pwd -e "START TRANSACTION; BEGIN;use $event_db ;DELETE a.* FROM ${event_tbl} a WHERE ${COND} and process_id in (select distinct process_id from ${event_hist} where ${COND}) ; COMMIT;"`
+DELT=$?
+
+ end_tm=`date +%s`
+
+ time_taken=`expr $end_tm - $str_tm`
+
+if [ $DELT -eq 0 ];then
+ echo -e "\nDelete from Event_buffer table is successful...!!!!!! \n"
+ echo "Time taken to Delete from main table (in sec): $time_taken"
+ echo
+else
+ echo "Delete from Event_buffer table Failed!!!"
+ echo "Delete from Event_buffer table Failed!!!. Please check PBDIARCHIVE application" | mail -s "Event Buffer Archival Failure" -r noreply@petebi-gap.com $consumer_config
+ return 8
+fi
+
+}
+
+
+Flag_P_E_check()
+{
+
+host=`grep -R -w "host" $CON_FILE | cut -d '~' -f2`
+event_db=`grep -R -w "event_db" $CON_FILE | cut -d '~' -f2`
+event_user=`grep -R -w "event_user" $CON_FILE | cut -d '~' -f2`
+event_pwd=`grep -R -w "event_pwd" $CON_FILE | cut -d '~' -f2`
+event_tbl=`grep -R -w "event_tbl" $CON_FILE | cut -d '~' -f2`
+event_hist=`grep -R -w "event_hist" $CON_FILE | cut -d '~' -f2`
+COND=`grep -R -w "COND" $CON_FILE | cut -d '~' -f2`
+
+
+echo "use $event_db ;SELECT count(*) from ${event_tbl} WHERE ${COND} ;"
+MySQLFlagP=`mysql -h$host -D$event_db -u$event_user -p$event_pwd -e "use $event_db ;SELECT count(*) from ${event_tbl} WHERE ${COND} ;"|tail -1`
+#echo $MySQLFlagP
+
+#MySQLFlagP_chk=`echo $MySQLFlagP | cut -d' ' -f2`
+MySQLFlagP_chk=$MySQLFlagP
+
+#echo $MySQLFlagP_chk
+ if [ $MySQLFlagP_chk -eq 0 ];then
+ echo "No records with FLAG P or E... Nothing to Process... !!!!"
+# return 0
+ else
+ echo "Records with P/E status: "$MySQLFlagP_chk
+ echo
+
+# echo -e "Updating processed records Flag to TA \n\n"
+
+# MySQL_Procsd_ToFLAG_A
+
+ echo -e "Archiving/ Inserting to History Table \n\n"
+
+ MySQL_Recrd_to_Archive
+
+ echo -e "Deleting the Archived data from event_buffer table.... \n\n"
+
+ MySQL_Recrd_Del
+ fi
+
+}
+
+execute()
+{
+#host=$1
+#event_db=$2
+#event_user=$3
+#event_pwd=$4
+#event_tbl=$5
+#event_hist=$6
+#COND=$7
+
+host=`grep -R -w "host" $CON_FILE | cut -d '~' -f2`
+event_db=`grep -R -w "event_db" $CON_FILE | cut -d '~' -f2`
+event_user=`grep -R -w "event_user" $CON_FILE | cut -d '~' -f2`
+event_pwd=`grep -R -w "event_pwd" $CON_FILE | cut -d '~' -f2`
+event_tbl=`grep -R -w "event_tbl" $CON_FILE | cut -d '~' -f2`
+event_hist=`grep -R -w "event_hist" $CON_FILE | cut -d '~' -f2`
+COND=`grep -R -w "COND" $CON_FILE | cut -d '~' -f2`
+
+#echo "mysql -h$host -D$event_db -u$event_user -p$event_pwd -e 'use $event_db ;select count(*) from ${event_tbl} where ${COND} and process_id in (select distinct process_id from ${event_hist} where ${COND} ) ;'"
+
+Record_check_A=`mysql -h$host -D$event_db -u$event_user -p$event_pwd -e "use $event_db ;select count(*) from ${event_tbl} where ${COND} and process_id in (select distinct process_id from ${event_hist} where ${COND} ) ;" | tail -1`
+echo -e "\nNumber of records which are present in both event_buffer and History table: "$Record_check_A
+echo
+
+#MySQLRec_chk_A=`echo $Record_check_A | cut -d' ' -f2`
+
+MySQLRec_chk_A=$Record_check_A
+
+if [ $MySQLRec_chk_A -eq 0 ];then
+
+ Flag_P_E_check
+
+else
+ echo -e "Previous Run Process_id exists.. Records with ${COND} exists \n\nProcessing previous records archival."
+
+ if [ $MySQLRec_chk_A -gt 0 ];then
+
+ echo -e "Previous run records found in main table.. ${MySQLRec_chk_A} \nOnly Deletion is carried ... \n\n"
+
+ MySQL_Recrd_Del
+
+ else
+ echo -e "Previous run failure.. Archival and deletion is started.. \n\n"
+ MySQL_Recrd_to_Archive
+ MySQL_Recrd_Del
+ fi
+
+Flag_P_E_check
+
+fi
+return 0
+
+}
+
+allTeams()
+{
+
+conn=`mysql -h$MYSQL_HOST -u$MYSQL_USER -p$MYSQL_PWD -D$MYSQL_DB -sN -e "select distinct source from ${queue_mst} where host_event_buffer is not null and active='Y';"`
+
+t_cond=$COND
+
+conn=$(echo $conn |sed 's/ / /g')
+
+count=$(echo $conn |sed 's/ / /g' |wc -w)
+echo $count
+
+i=1;
+
+while [ $i -le $count ];
+do
+
+if [ -s $CON_FILE ];then
+
+rm -r $CON_FILE
+fi
+
+COND=${t_cond}
+
+var=$(echo $conn | cut -d" " -f${i})
+
+echo "$i - Executing Archival for $var "
+
+src="source='${var}'"
+COND="$COND AND Subj_area='${var}'"
+
+echo "COND~$COND" >> $CON_FILE
+
+getConnection $src $COND
+
+wait
+
+i=$(( i + 1))
+done
+
+}
+
+
+
+if [ $num -eq 3 ];then
+
+echo "Date Filter: "$DT_FLT
+echo "SUBJ_AREA: "$SUBJ_AREA
+echo "Table Name: "$TBL_NAME
+export COND="FLAG IN ('P','E','A') AND Subj_area='${SUBJ_AREA}' AND tgt_tbl_n='${TBL_NAME}' AND DATE(${date_col})<adddate(current_date(),-${DT_FLT}) "
+
+echo COND~$COND >> $CON_FILE
+
+src="source='${SUBJ_AREA}' and tgt_tbl_n='${TBL_NAME}'"
+
+getConnection $src $COND
+
+
+#echo -e "$host \n$event_user \n$event_pwd \n$event_db \n$event_tbl"
+
+elif [ $num -eq 2 ];then
+ if [[ -n $DT_FLT && -n $SUBJ_AREA ]];then
+ echo "Date Filter: "$DT_FLT
+ echo "SUBJ_AREA: "$SUBJ_AREA
+ export COND="FLAG IN ('P','E','A') AND Subj_area='${SUBJ_AREA}' AND DATE(${date_col})<adddate(current_date(),-${DT_FLT}) "
+ 
+ echo COND~$COND >> $CON_FILE
+ 
+ src="source='${SUBJ_AREA}'"
+ echo $src >> $CON_FILE
+
+ getConnection $src $COND
+
+
+ elif [[ -n $DT_FLT && -n $TBL_NAME ]];then
+ echo "Date Filter: "$DT_FLT
+ echo "Table Name: "$TBL_NAME
+ export COND="FLAG IN ('P','E','A') AND tgt_tbl_n='${TBL_NAME}' AND DATE(${date_col})<adddate(current_date(),-${DT_FLT}) "
+
+ echo COND~$COND >> $CON_FILE
+ 
+ src="tgt_tbl_n='${TBL_NAME}'"
+ echo $src >> $CON_FILE
+
+ getConnection $src $COND
+
+
+ elif [[ -n $SUBJ_AREA && -n $TBL_NAME ]];then
+ echo "SUBJ_AREA: "$SUBJ_AREA
+ echo "Table Name: "$TBL_NAME
+ DT_FLT=0
+ export COND="FLAG IN ('P','E','A') AND Subj_area='${SUBJ_AREA}' AND tgt_tbl_n='${TBL_NAME}' AND DATE(${date_col})<current_date()"
+ echo COND~$COND >> $CON_FILE
+ 
+ src="source='${SUBJ_AREA}' and tgt_tbl_n='${TBL_NAME}'"
+ echo $src >> $CON_FILE
+
+ getConnection $src $COND
+
+
+ else
+ echo "Parameters not valid"
+ exit 8
+ fi
+
+elif [ $num -eq 1 ];then
+ if [ ! -z $DT_FLT ];then
+ echo "Date Filter: "$DT_FLT
+ export COND="FLAG IN ('P','E','A') AND DATE(${date_col})<adddate(current_date(),-${DT_FLT}) "
+
+ allTeams $COND
+
+ elif [ ! -z $TBL_NAME ];then
+ echo "Table Name: "$TBL_NAME
+ export COND="FLAG IN ('P','E','A') AND tgt_tbl_n='${TBL_NAME}' AND DATE(${date_col})<current_date()"
+ echo COND~$COND >> $CON_FILE
+ src="tgt_tbl_n='${TBL_NAME}'"
+ echo $src >> $CON_FILE
+ 
+ getConnection $src $COND
+
+
+ elif [ ! -z $SUBJ_AREA ];then
+ echo "SUBJ_AREA: "$SUBJ_AREA
+ export COND="FLAG IN ('P','E','A') AND Subj_area='${SUBJ_AREA}' AND DATE(${date_col})<current_date()"
+ 
+ echo COND~"FLAG IN ('P','E','A') AND Subj_area='${SUBJ_AREA}' AND DATE(${date_col})<current_date()" >> $CON_FILE
+ src="source='${SUBJ_AREA}'"
+ echo "source='${SUBJ_AREA}'" >> $CON_FILE
+
+ getConnection $src $COND
+
+
+ else
+ exit 8
+ fi
+else
+ echo "No Parameters passed. Archival of records for complete $event_tbl table which are processed and have DATE(${date_col})<current_date() for all Pete Tracks."
+ export COND="FLAG IN ('P','E','A') and DATE(${date_col})<current_date() "
+
+ allTeams $COND
+if [ -s $CON_FILE ];then 
+ rm -r $CON_FILE
+fi
+
+fi
